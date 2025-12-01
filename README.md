@@ -6,6 +6,11 @@
 
 This repository implements **field-level simulation-based inference (SBI)** for cosmological initial conditions from masked and noisy observational data. The method uses a Gaussian Neural Posterior Estimation (NPE) framework combined with U-Net architectures to infer the primordial density field from late-time observations while properly accounting for incomplete sky coverage (masking) and observational noise.
 
+<p align="center">
+  <img src="plots/animation_250908_163622_OU_sampling_Qx_mask_ic.gif" alt="Posterior Sampling Animation" width="600">
+</p>
+<p align="center"><em>OU sampling of the posterior distribution for the initial conditions, demonstrating convergence from prior samples to posterior samples conditioned on masked late-time observations.</em></p>
+
 ## 🔬 Scientific Background
 
 Field-level inference aims to reconstruct the initial conditions of the Universe from observed galaxy distributions or matter density fields. Unlike traditional summary-statistic-based approaches, field-level methods preserve all information in the data, enabling optimal extraction of cosmological information.
@@ -113,16 +118,6 @@ pip install discodj             # Differentiable N-body simulations
 | `map2map` | - | U-Net architecture |
 | `jax` | ≥0.4 | Forward simulations (optional) |
 | `zarr` | ≥2.0 | Dataset storage |
-
-## 📊 Results
-
-### Posterior Sampling Animation
-
-The animation below shows the Ornstein-Uhlenbeck (OU) sampling process for the posterior distribution of the initial density field, starting from a prior sample and converging to samples consistent with the masked observed data:
-
-![Posterior Sampling Animation](plots/animation_250908_163622_OU_sampling_Qx_mask_ic.gif)
-
-*OU sampling of the posterior distribution for the initial conditions, demonstrating convergence from prior samples to posterior samples conditioned on masked late-time observations.*
 
 ## 📖 Usage
 
