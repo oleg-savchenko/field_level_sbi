@@ -1,0 +1,325 @@
+import time
+import ray
+from falcon.core.zarrstore import DatasetView
+from torch.utils.data import DataLoader
+import asyncio
+import torch
+
+class OnlineEvidenceFilter:
+    def __init__(self, offline_evidence, resample_subgraph, evidence, graph):
+        self.offline_evidence = offline_evidence
+        self.resample_subgraph = resample_subgraph
+        self.evidence = evidence
+        self.graph = graph
+
+        # Instantiate online nodes
+        self.online_nodes = {}
+        for k in self.resample_subgraph:
+            self.online_nodes[k] = graph.get_create_module(k)(**graph.node_dict[k].module_config)
+
+    def __call__(self, values):
+        # Associate inputs with keywords
+        values_dict = {k: v for k, v in zip(self.offline_evidence, values[1:])}
+        
+        # Run through online nodes and add to values_dict
+        for k, v in self.online_nodes.items():
+            conditions = [values_dict[parent] for parent in self.graph.get_parents(k)]
+            # Turn conditions into tensors and add a single batch dimension
+            conditions = [torch.tensor(c).unsqueeze(0) for c in conditions]
+            sample = v.sample(1, parent_conditions=conditions)
+            # Remove batch dimension and turn into numpy
+            sample = sample.squeeze(0).numpy()
+            values_dict[k] = sample
+
+        # Return projection of values_dict to evidence
+        output = values[:1] + [values_dict[k] for k in self.evidence]
+        return output
+
+@ray.remote
+class MultiplexNodeWrapper:
+    def __init__(self, actor_configs, node, graph):
+        self.wrapped_node_list = [NodeWrapper.options(
+            **actor_config).remote(node, graph) for actor_config in actor_configs]
+        self.num_actors = len(self.wrapped_node_list)
+
+    def sample(self, n_samples, incoming = None):
+        #num_samples_per_node = n_samples // self.num_actors
+        #index_range_list = [(i*num_samples_per_node, (i+1)*num_samples_per_node) for i in range(self.num_actors)]
+        #index_range_list[-1] = (index_range_list[-1][0], n_samples)
+
+        num_samples_per_node = n_samples / self.num_actors
+        index_range_list = [(int(i*num_samples_per_node), int((i+1)*num_samples_per_node)) for i in range(self.num_actors)]
+        index_range_list[-1] = (index_range_list[-1][0], n_samples)
+
+        futures = []
+        for i, (start, end) in enumerate(index_range_list):
+            my_incoming = [v[start:end] for v in incoming]
+            futures.append(self.wrapped_node_list[i].sample.remote(end-start, incoming=my_incoming))
+        samples = ray.get(futures)
+        samples = torch.cat(samples, dim=0)
+        return samples
+
+    def conditioned_sample(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def proposal_sample(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def get_shape_and_dtype(self):
+        node = self.wrapped_node_list[0]  # Use first node
+        return ray.get(node.get_shape_and_dtype.remote())
+
+
+
+# This is a wrapper node that will be used to instantiate Module within ray actors
+# Nodes are passed to the init method
+@ray.remote
+class NodeWrapper:
+    def __init__(self, node, graph):
+        self.node = node
+        self.module = node.create_module(**node.module_config)
+        self.parents = node.parents
+        self.evidence = node.evidence
+        self.name = node.name
+        self.offline_evidence, self.resample_subgraph = graph.get_resample_parents_and_graph(
+            self.evidence)
+        #print("Node:", self.name)
+        #print("Offline evidence:", self.offline_evidence)
+        #print("Resample subgraph:", self.resample_subgraph)
+        self.graph = graph
+
+    async def train(self, dataset_manager, observations = {}, num_trailing_samples = None):
+        print("Training started for:", self.name)
+        keys_train = [self.name] + self.offline_evidence
+        keys_val = [self.name] + self.evidence
+        filter_train = OnlineEvidenceFilter(self.offline_evidence, self.resample_subgraph, self.evidence, self.graph)
+        #filter_val = OnlineEvidenceFilter(self.evidence, [], self.evidence, self.graph)
+
+        batch_size = self.node.module_config.get('batch_size', 128)
+
+        active_only = False
+        dataset_train = ray.get(
+            dataset_manager.get_train_dataset_view.remote(keys_train, filter=filter_train, active_only=active_only))
+        dataset_val = ray.get(
+            dataset_manager.get_val_dataset_view.remote(keys_val, filter=None, active_only=active_only))
+        dataloader_train = DataLoader(dataset_train, batch_size=batch_size)
+        dataloader_val = DataLoader(dataset_val, batch_size=batch_size)
+
+        def hook_fn(module, batch):
+            id, theta, conditions = batch[0], batch[1], batch[2:]
+            for i, k in enumerate(self.evidence):
+                if k in observations.keys():
+                    conditions[i] = observations[k]
+            # Corresponding id
+            mask = module.discardable(theta, conditions)
+            ids = id[mask]
+            ids = list(ids.numpy())
+
+            # Deactivate samples
+            if dataset_manager is not None:
+                dataset_manager.deactivate.remote(ids)
+
+        await self.module.train(dataloader_train, dataloader_val, hook_fn=hook_fn)
+        print("...training complete for:", self.name)
+
+    def get_module(self):
+        return self.module
+
+    def get_node_type(self):
+        if hasattr(self.module, 'sample'):
+            return 'stochastic'
+        else:
+            return 'deterministic'
+
+    def get_shape_and_dtype(self):
+        return self.module.get_shape_and_dtype()
+
+    def sample(self, n_samples, incoming = None):
+        node_type = self.get_node_type()
+        if node_type == 'stochastic':
+            return self.module.sample(n_samples, parent_conditions = incoming)
+        elif node_type == 'deterministic':
+            return self.module.compute(incoming)
+        else:
+            raise ValueError(f"Unknown node type: {node_type}")
+
+    def conditioned_sample(self, n_samples, parent_conditions=[], evidence_conditions=[]):
+        samples = self.module.conditioned_sample(n_samples,
+            parent_conditions=parent_conditions, evidence_conditions=evidence_conditions)
+        return samples
+
+    def proposal_sample(self, n_samples, parent_conditions=[], evidence_conditions=[]):
+        samples = self.module.proposal_sample(n_samples,
+            parent_conditions=parent_conditions, evidence_conditions=evidence_conditions)
+        return samples
+
+    def call_method(self, method_name, *args, **kwargs):
+        method = getattr(self.module, method_name)
+        return method(*args, **kwargs)
+
+
+class DeployedGraph:
+    def __init__(self, graph):
+        """Initialize a DeployedGraph with the given conceptual graph of nodes."""
+        self.graph = graph
+        self.wrapped_nodes_dict = {}
+        self.deploy_nodes()
+
+    def deploy_nodes(self):
+        """Deploy all nodes in the graph as Ray actors."""
+        ray.init(ignore_reinit_error=True)  # Initialize Ray if not already done
+        for node in self.graph.node_list:
+            if isinstance(node.actor_config, list):
+                self.wrapped_nodes_dict[node.name] = MultiplexNodeWrapper.remote(node.actor_config, node, self.graph)
+            else:
+                self.wrapped_nodes_dict[node.name] = NodeWrapper.options(**node.actor_config).remote(node, self.graph)
+
+    def sample(self, num_samples, conditions = {}):
+        """Run the graph using deployed nodes and return results."""
+        sorted_node_names = self.graph.sorted_node_names
+        sample_dict = conditions.copy()
+
+        # Process nodes in topological order
+        for name in sorted_node_names:
+            if name in sample_dict.keys():
+                continue
+            incoming = [sample_dict[parent] for parent in self.graph.get_parents(name)]
+            sample_dict[name] = ray.get(self.wrapped_nodes_dict[name].sample.remote(num_samples, incoming=incoming))
+        
+        return sample_dict
+
+    def conditioned_sample(self, num_samples, conditions = {}):
+        """Run the graph using deployed nodes and return results."""
+        sorted_node_names = self.graph.sorted_inference_node_names
+        conditions = conditions.copy()
+
+        # Process nodes in topological order
+        for name in sorted_node_names:
+            if name in conditions.keys():
+                continue
+            evidence_conditions = (
+                [conditions[parent] for parent in self.graph.get_evidence(name)]
+            )
+            parent_conditions = (
+                [conditions[parent] for parent in self.graph.get_parents(name)]
+            )
+            conditions[name] = ray.get(
+                self.wrapped_nodes_dict[name].conditioned_sample.remote(num_samples,
+                parent_conditions=parent_conditions, evidence_conditions=evidence_conditions)
+                )
+            #try:
+            #    conditions[name] = ray.get(self.wrapped_nodes_dict[name].conditioned_sample.remote(num_samples, incoming))
+            #except AttributeError:
+            #    print("WARNING: Using sample instead of conditioned_sample for:", name)
+            #    conditions[name] = ray.get(self.wrapped_nodes_dict[name].sample.remote(num_samples, incoming=incoming))
+        
+        return conditions
+
+    def proposal_sample(self, num_samples, conditions = {}):
+        """Run the graph using deployed nodes and return results."""
+        sorted_node_names = self.graph.sorted_inference_node_names
+        conditions = conditions.copy()
+
+        # Process nodes in topological order
+        for name in sorted_node_names:
+            if name in conditions.keys():
+                continue
+            parent_conditions = (
+                [conditions[parent] for parent in self.graph.get_parents(name)]
+            )
+            evidence_conditions = (
+                [conditions[parent] for parent in self.graph.get_evidence(name)]
+            )
+            conditions[name] = ray.get(self.wrapped_nodes_dict[name].proposal_sample.remote(
+                num_samples, parent_conditions=parent_conditions, evidence_conditions=evidence_conditions))
+            #try:
+            #    conditions[name] = ray.get(self.wrapped_nodes_dict[name].proposal_sample.remote(num_samples, incoming))
+            #except AttributeError:
+            #    print("WARNING: Using sample instead of conditioned_sample for:", name)
+            #    conditions[name] = ray.get(self.wrapped_nodes_dict[name].sample.remote(num_samples, incoming=incoming))
+        
+        return conditions
+
+    def shutdown(self):
+        """Shut down the deployed graph and release resources."""
+        ray.shutdown()
+
+    def get_shapes_and_dtypes(self):
+        """Get the shapes of the output tensors of the deployed graph."""
+        # TODO: Automatize this
+        shapes_and_dtypes = {}
+        for name, node in self.wrapped_nodes_dict.items():
+            shapes_and_dtypes[name] = ray.get(node.get_shape_and_dtype.remote())
+        return shapes_and_dtypes
+
+    def train(self, dataset_manager, observations):
+        asyncio.run(self._train(dataset_manager, observations))
+
+    async def _train(self, dataset_manager, observations):
+        # Initial data generation
+        num_samples = ray.get(dataset_manager.get_length.remote())
+        num_min_sims = ray.get(dataset_manager.get_num_min_sims.remote())
+        num_resims = ray.get(dataset_manager.get_num_resims.remote())
+        if num_min_sims > num_samples:
+            print("Generate new samples / num_active:", num_min_sims - num_samples)
+            ray.get(dataset_manager.generate_samples.remote(self, num_sims = num_min_sims - num_samples))
+
+        num_sims = ray.get(dataset_manager.get_num_min_sims.remote())
+        #samples = self.sample(num_sims)
+        #ray.get(dataset_manager.append.remote(samples))
+        #time.sleep(1)
+        print("Initial number of simulations:", num_sims)
+
+        # Training
+        train_future_list = []
+        for name, node in self.graph.node_dict.items():
+            if node.train:
+                wrapped_node = self.wrapped_nodes_dict[name]
+                train_future = wrapped_node.train.remote(
+                    dataset_manager, observations=observations)
+                train_future_list.append(train_future)
+                time.sleep(1)
+
+        #n_train = ray.get(dataset_manager.get_num_active.remote())  # Initial number of samples
+
+#        while True:
+#            ready, _ = ray.wait(train_future_list, num_returns=len(train_future_list), timeout=1)
+#            num_active = ray.get(dataset_manager.get_num_active.remote())
+#            num_new_samples = min(n_train - num_active, 128)
+#            if num_new_samples > 0:
+#                print("Generate new samples / num_active:", num_new_samples, num_active)
+#                new_samples = self.proposal_sample(num_new_samples, observations)
+#                for key in observations.keys():  # Remove observations from new samples
+#                    del new_samples[key]
+#                new_samples = self.sample(num_new_samples, conditions = new_samples)
+#                ray.get(dataset_manager.append.remote(new_samples))
+#            if len(ready) == len(train_future_list):
+#                print("All training finished!")
+#                break
+
+        while train_future_list:
+            ready, train_future_list = ray.wait(train_future_list, num_returns=len(train_future_list), timeout=1)
+            active = ray.get(dataset_manager.is_active.remote())
+            # FIX: Fix this to work adaptively again
+            generate_new_samples = not all(active[-num_sims:])  # Check if any of the last n_train samples are invalid
+            #time.sleep(10)
+            if generate_new_samples:
+                num_new_samples = num_resims
+                print("Generate new samples:", num_new_samples)
+                new_samples = self.proposal_sample(num_new_samples, observations)
+                for key in observations.keys():  # Remove observations from new samples
+                    del new_samples[key]
+                new_samples = self.sample(num_new_samples, conditions = new_samples)
+                ray.get(dataset_manager.append.remote(new_samples))
+            
+            for completed_task in ready:
+                result = ray.get(completed_task)  # Retrieve the result or raise an exception
+                print(f"Result: {result}")
+                #try:
+                #    result = ray.get(completed_task)  # Retrieve the result or raise an exception
+                #    print(f"Result: {result}")
+                #except ray.exceptions.RayTaskError as e:
+                #    #print(f"Error from task: {e}")
+                #    ray.shutdown()
+                #    raise e # Re-raise the exception to propagate it
+
