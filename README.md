@@ -2,7 +2,6 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 This repository implements **field-level simulation-based inference (SBI)** for cosmological initial conditions from masked and noisy observational data. The method uses a Gaussian Neural Posterior Estimation (NPE) framework combined with U-Net architectures to infer the primordial density field from late-time observations while properly accounting for incomplete sky coverage (masking) and observational noise.
 
@@ -27,7 +26,7 @@ Key features of this implementation:
 .
 ├── field_level_sbi/                 # 🔑 Main inference modules (core of this project)
 │   ├── gaussian_npe_model.py        # Precision matrix parameterizations (GDG factorization)
-│   ├── gaussian_npe_training        # Training utilities (Chebyshev log-det, CG solver)
+│   ├── gaussian_npe_training.py     # Training utilities (Chebyshev log-det, CG solver)
 │   ├── training_script_masked_data.py  # Training pipeline and NPE network
 │   └── utils.py                     # Power spectrum, plotting, mask generation
 │
